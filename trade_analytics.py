@@ -8,6 +8,8 @@ os.environ["PATH"] = (
     + os.environ["PATH"]
 )
 
+import psycopg2
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, from_json, from_unixtime, window,
@@ -17,6 +19,15 @@ from pyspark.sql.types import StructType, StructField, StringType, DoubleType, L
 
 KAFKA_BOOTSTRAP = "localhost:9092"
 KAFKA_TOPIC = "crypto-trades"
+
+# Matches the credentials in your docker-compose.yml postgres service
+PG_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "crypto_pipeline",
+    "user": "streaming_user",
+    "password": "streaming_pass",
+}
 
 # Width of each aggregation window. Use "30 seconds" while testing
 # so you don't have to wait as long to see a window close.
@@ -36,6 +47,10 @@ spark = (
     # what causes the "idWithoutTopologyInfo is null" heartbeat error).
     .config("spark.driver.host", "127.0.0.1")
     .config("spark.driver.bindAddress", "127.0.0.1")
+    # Force UTC everywhere so window_start/window_end match Postgres's
+    # inserted_at (which defaults to UTC) -- avoids confusing timezone
+    # gaps when you later build a dashboard on top of this table.
+    .config("spark.sql.session.timeZone", "UTC")
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
@@ -93,30 +108,57 @@ windowed = (
 # without a second Spark job or an external database.
 previous_avg_price = {}
 
+# One connection, opened once and reused across microbatches, rather
+# than reconnecting to Postgres on every batch (which would be slow
+# and would quickly exhaust connection limits on a fast stream).
+pg_conn = psycopg2.connect(**PG_CONFIG)
+pg_conn.autocommit = True
+
+INSERT_SQL = """
+    INSERT INTO trade_window_stats
+        (symbol, window_start, window_end, avg_price, min_price,
+         max_price, total_volume, trade_count, is_anomaly)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
 
 def process_batch(batch_df, batch_id):
-    for row in batch_df.collect():
-        symbol = row["symbol"]
-        avg_price = row["avg_price"]
+    with pg_conn.cursor() as cur:
+        for row in batch_df.collect():
+            symbol = row["symbol"]
+            avg_price = row["avg_price"]
 
-        print(
-            f"[{row['window_start']} - {row['window_end']}] {symbol}: "
-            f"avg={avg_price:.2f} min={row['min_price']:.2f} "
-            f"max={row['max_price']:.2f} volume={row['total_volume']:.4f} "
-            f"trades={row['trade_count']}"
-        )
+            print(
+                f"[{row['window_start']} - {row['window_end']}] {symbol}: "
+                f"avg={avg_price:.2f} min={row['min_price']:.2f} "
+                f"max={row['max_price']:.2f} volume={row['total_volume']:.4f} "
+                f"trades={row['trade_count']}"
+            )
 
-        prev = previous_avg_price.get(symbol)
-        if prev is not None:
-            pct_change = abs(avg_price - prev) / prev * 100
-            if pct_change >= SPIKE_THRESHOLD_PCT:
-                direction = "UP" if avg_price > prev else "DOWN"
-                print(
-                    f"  ANOMALY: {symbol} moved {direction} {pct_change:.2f}% "
-                    f"between windows (prev avg={prev:.2f}, now={avg_price:.2f})"
-                )
+            is_anomaly = False
+            prev = previous_avg_price.get(symbol)
+            if prev is not None:
+                pct_change = abs(avg_price - prev) / prev * 100
+                if pct_change >= SPIKE_THRESHOLD_PCT:
+                    is_anomaly = True
+                    direction = "UP" if avg_price > prev else "DOWN"
+                    print(
+                        f"  ANOMALY: {symbol} moved {direction} {pct_change:.2f}% "
+                        f"between windows (prev avg={prev:.2f}, now={avg_price:.2f})"
+                    )
 
-        previous_avg_price[symbol] = avg_price
+            previous_avg_price[symbol] = avg_price
+
+            try:
+                cur.execute(INSERT_SQL, (
+                    symbol, row["window_start"], row["window_end"],
+                    avg_price, row["min_price"], row["max_price"],
+                    row["total_volume"], row["trade_count"], is_anomaly,
+                ))
+            except Exception as e:
+                # Don't let a single bad insert crash the whole stream --
+                # print it and keep processing later batches.
+                print(f"  Postgres insert failed: {e}")
 
 
 query = (
