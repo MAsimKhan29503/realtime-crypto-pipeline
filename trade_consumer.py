@@ -21,6 +21,8 @@ spark = (
     SparkSession.builder
     .appName("BinanceTradeConsumer")
     .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0")
+    .config("spark.driver.host", "127.0.0.1")
+    .config("spark.driver.bindAddress", "127.0.0.1")
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
