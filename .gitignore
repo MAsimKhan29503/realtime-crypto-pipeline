@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Spark / Ivy
+.ivy2*/
+metastore_db/
+spark-warehouse/
+derby.log
+
+# Checkpoints (Spark streaming writes these locally)
+checkpoint/
+C:/tmp/
+
+# OS/editor
+.vscode/
+.DS_Store
